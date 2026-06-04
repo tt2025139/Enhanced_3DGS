@@ -20,7 +20,8 @@ class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
-                 train_test_exp = False, is_test_dataset = False, is_test_view = False
+                 train_test_exp = False, is_test_dataset = False, is_test_view = False,
+                 person_mask = None
                  ):
         super(Camera, self).__init__()
 
@@ -57,6 +58,12 @@ class Camera(nn.Module):
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 
+        if person_mask is not None:
+            person_mask_resized = cv2.resize(person_mask.astype(np.float32), (self.image_width, self.image_height), interpolation=cv2.INTER_NEAREST)
+            self.person_mask = torch.from_numpy(person_mask_resized[None]).to(self.data_device)
+        # else:
+        #     self.person_mask = torch.ones((1, self.image_height, self.image_width), device=self.data_device)
+
         self.invdepthmap = None
         self.depth_reliable = False
         if invdepthmap is not None:
@@ -78,7 +85,10 @@ class Camera(nn.Module):
             self.invdepthmap = torch.from_numpy(self.invdepthmap[None]).to(self.data_device)
 
         self.zfar = 100.0
+        # [zzx 2026-06-04] 修复鱼眼边缘"拉丝": znear 0.01 太小, 镜头正前方贴脸高斯被极度拉伸
+        #                  调大 znear 裁掉这些近平面高斯 (场景对角≈12, 相机间距≈0.13)
         self.znear = 0.01
+        # self.znear = 0.2  # [zzx]
 
         self.trans = trans
         self.scale = scale

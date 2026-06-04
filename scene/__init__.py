@@ -41,10 +41,10 @@ class Scene:
         self.test_cameras = {}
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, getattr(args, 'masks', ''), args.eval, args.train_test_exp)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, getattr(args, 'masks', ''), args.eval)
         else:
             assert False, "Could not recognize scene type!"
 
@@ -67,6 +67,7 @@ class Scene:
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
+        # self.scene_info = scene_info
 
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
@@ -94,7 +95,17 @@ class Scene:
             json.dump(exposure_dict, f, indent=2)
 
     def getTrainCameras(self, scale=1.0):
+        if scale not in self.train_cameras:
+            print("Loading Training Cameras at resolution scale {} on demand".format(scale))
+            self.train_cameras[scale] = cameraList_from_camInfos(
+                self.scene_info.train_cameras, scale, self.args,
+                self.scene_info.is_nerf_synthetic, False)
         return self.train_cameras[scale]
 
     def getTestCameras(self, scale=1.0):
+        if scale not in self.test_cameras:
+            print("Loading Test Cameras at resolution scale {} on demand".format(scale))
+            self.test_cameras[scale] = cameraList_from_camInfos(
+                self.scene_info.test_cameras, scale, self.args,
+                self.scene_info.is_nerf_synthetic, True)
         return self.test_cameras[scale]

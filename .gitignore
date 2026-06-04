@@ -1,8 +1,50 @@
 *.pyc
+*.pyo
+*.bak
+*.log
+*.egg-info
+*.so
+*.o
+
+# IDE
 .vscode
-output
-build
+.idea
+*.swp
+*.swo
+
+# Output
+output/
+screenshots/
+tensorboard_3d/
+
+# Build artifacts
+build/
+dist/
 diff_rasterization/diff_rast.egg-info
 diff_rasterization/dist
-tensorboard_3d
-screenshots
+
+# Training outputs (models, checkpoints, renders)
+*.ply
+*.pth
+results.json
+
+# Submodule build artifacts
+submodules/diff-gaussian-rasterization/build/
+submodules/diff-gaussian-rasterization/dist/
+submodules/diff-gaussian-rasterization/*.egg-info
+submodules/simple-knn/build/
+submodules/simple-knn/dist/
+submodules/simple-knn/*.egg-info
+submodules/fused-ssim/build/
+submodules/fused-ssim/dist/
+submodules/fused-ssim/*.egg-info
+
+# Large assets (GIFs)
+assets/*.gif
+
+# SIBR viewers build
+SIBR_viewers/build/
+
+# Scripts not needed for core functionality
+test.sh
+run_floater_experiments.sh

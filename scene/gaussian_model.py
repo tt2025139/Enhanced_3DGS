@@ -195,7 +195,6 @@ class GaussianModel:
             try:
                 self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
             except:
-                # A special version of the rasterizer is required to enable sparse adam
                 self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
@@ -211,7 +210,6 @@ class GaussianModel:
                                                         max_steps=training_args.iterations)
 
     def update_learning_rate(self, iteration):
-        ''' Learning rate scheduling per step '''
         if self.pretrained_exposures is None:
             for param_group in self.exposure_optimizer.param_groups:
                 param_group['lr'] = self.exposure_scheduler_args(iteration)
@@ -224,7 +222,6 @@ class GaussianModel:
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
-        # All channels except the 3 DC
         for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
             l.append('f_dc_{}'.format(i))
         for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
@@ -289,7 +286,6 @@ class GaussianModel:
         features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
         features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
@@ -408,7 +404,6 @@ class GaussianModel:
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
-        # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
@@ -449,7 +444,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, cameras=None, depth_prune_threshold=0.3, depth_prune_min_views=2):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -462,12 +457,103 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+
+        if cameras is not None and depth_prune_threshold > 0:
+            depth_prune_mask = self.depth_consistency_prune(cameras, depth_prune_threshold, depth_prune_min_views)
+            prune_mask = torch.logical_or(prune_mask, depth_prune_mask)
+
         self.prune_points(prune_mask)
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
-        self.denom[update_filter] += 1
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, pixels=None):
+        if pixels is not None:
+            self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True) * pixels[update_filter]
+            self.denom[update_filter] += pixels[update_filter]
+        else:
+            self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+            self.denom[update_filter] += 1
+
+    def depth_consistency_prune(self, cameras, threshold, min_views):
+        import random
+        xyz = self.get_xyz
+        N = xyz.shape[0]
+        inconsistent_count = torch.zeros(N, device="cuda")
+
+        reliable_cams = [cam for cam in cameras if cam.depth_reliable]
+        sample_cams = random.sample(reliable_cams, min(len(reliable_cams), 64))
+
+        for cam in sample_cams:
+
+            world_view = cam.world_view_transform
+            full_proj = cam.full_proj_transform
+
+            ones = torch.ones(N, 1, device="cuda")
+            homo_xyz = torch.cat([xyz, ones], dim=1)
+
+            proj = homo_xyz @ full_proj.T
+            w = proj[:, 3].clamp(min=1e-6)
+            screen_x = (proj[:, 0] / w + 1) * 0.5 * cam.image_width
+            screen_y = (proj[:, 1] / w + 1) * 0.5 * cam.image_height
+
+            view_xyz = homo_xyz @ world_view.T
+            gs_depth = -view_xyz[:, 2]
+
+            valid = (screen_x >= 0) & (screen_x < cam.image_width) & \
+                    (screen_y >= 0) & (screen_y < cam.image_height) & \
+                    (gs_depth > 0)
+
+            if not valid.any():
+                continue
+
+            sx = screen_x[valid].long().clamp(0, cam.image_width - 1)
+            sy = screen_y[valid].long().clamp(0, cam.image_height - 1)
+
+            mono_invdepth = cam.invdepthmap.cuda()
+            if mono_invdepth.ndim == 3:
+                mono_invdepth = mono_invdepth[0]
+
+            sampled_mono_invdepth = mono_invdepth[sy, sx]
+
+            valid_mono = sampled_mono_invdepth > 1e-6
+            if not valid_mono.any():
+                continue
+
+            gs_invdepth = 1.0 / gs_depth[valid].clamp(min=1e-6)
+
+            depth_ratio = gs_invdepth[valid_mono] / sampled_mono_invdepth[valid_mono]
+            inconsistent = (depth_ratio < threshold) | (depth_ratio > (1.0 / threshold))
+
+            idx_valid = torch.where(valid)[0]
+            idx_inconsistent = idx_valid[valid_mono][inconsistent]
+            inconsistent_count[idx_inconsistent] += 1
+
+        prune_mask = inconsistent_count >= min_views
+        return prune_mask
+
+    def spatial_regularization(self, cameras, percent=0.05):
+        import random
+        xyz = self.get_xyz
+        N = xyz.shape[0]
+
+        sample_cams = random.sample(cameras, min(len(cameras), 32))
+        cam_centers = torch.stack([c.camera_center for c in sample_cams])
+
+        min_dist_sq = torch.full((N,), float('inf'), device="cuda")
+        chunk_size = 8
+        for i in range(0, len(sample_cams), chunk_size):
+            chunk_centers = cam_centers[i:i+chunk_size]
+            diff = xyz.unsqueeze(1) - chunk_centers.unsqueeze(0)
+            dist_sq = (diff ** 2).sum(dim=2)
+            chunk_min = dist_sq.min(dim=1).values
+            min_dist_sq = torch.minimum(min_dist_sq, chunk_min)
+
+        dist_threshold = torch.quantile(min_dist_sq.sqrt(), percent)
+        far_mask = min_dist_sq.sqrt() > dist_threshold
+
+        opacity = self.get_opacity.squeeze()
+        reg_loss = far_mask.float() * opacity * min_dist_sq.sqrt() / dist_threshold.clamp(min=1e-6)
+
+        return reg_loss.mean()

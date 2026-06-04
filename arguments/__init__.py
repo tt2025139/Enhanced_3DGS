@@ -51,6 +51,7 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self._images = "images"
         self._depths = ""
+        self.masks = ""
         self._resolution = -1
         self._white_background = False
         self.train_test_exp = False
@@ -61,6 +62,8 @@ class ModelParams(ParamGroup):
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        if not hasattr(g, 'masks'):
+            g.masks = ''
         return g
 
 class PipelineParams(ParamGroup):
@@ -93,10 +96,31 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+        self.depth_threshold = 0.37
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        self.pixel_gs = False
+        self.opacity_prune_threshold = 0.005
+        self.depth_prune = False
+        self.depth_prune_threshold = 0.3
+        self.depth_prune_min_views = 2
+        self.spatial_reg = False
+        self.spatial_reg_weight = 0.1
+        self.spatial_reg_percent = 0.05
+        self.abs_gs = False
+        self.cap_max = 0
+        self.densify_grad_abs_threshold = 0.0004
+        self.progressive_resolution = False
+        self.resolution_schedule_1 = 3000
+        self.resolution_scale_1 = 4.0
+        self.resolution_schedule_2 = 6000
+        self.resolution_scale_2 = 2.0
+        self.resolution_scale_3 = 1.0
+        self.lr_scale_factor = 0.5
+        self.densify_grad_threshold_scale = False
+        self.grad_clip_norm = 0.0
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
