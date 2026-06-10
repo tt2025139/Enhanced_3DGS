@@ -121,6 +121,13 @@ class OptimizationParams(ParamGroup):
         self.lr_scale_factor = 0.5
         self.densify_grad_threshold_scale = False
         self.grad_clip_norm = 0.0
+        # [zzx palette 2026-06-07] 调色板编辑: DC 基础色重参数化为 K 个调色板色的凸组合
+        self.use_palette = False            # 是否启用调色板参数化
+        self.palette_size = 8               # 调色板色数 K
+        self.palette_init_iter = 0          # 第几步从当前 DC 颜色 k-means 提取调色板(0=训练开始即用 SfM 颜色)
+        self.palette_lr = 0.005             # 调色板色学习率
+        self.palette_weight_lr = 0.01       # 逐点权重 logits 学习率
+        self.palette_entropy_weight = 0.0   # 可选: 权重熵正则权重(>0 鼓励稀疏/单一调色板色, 利于干净重上色)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -10,6 +10,8 @@ from pathlib import Path
 from PIL import Image
 import numpy as np
 import torchvision
+from scipy.ndimage import gaussian_filter1d
+from scipy.spatial.transform import Rotation
 
 from scene import Scene, GaussianModel
 from gaussian_renderer import render
@@ -19,13 +21,40 @@ from utils.camera_utils import Camera
 from argparse import ArgumentParser
 
 
+def smooth_poses(poses, sigma):
+    """
+    对相机位姿序列做高斯平滑：平移用 gaussian_filter1d，旋转转四元数再平滑。
+    sigma=0 表示不平滑。
+    """
+    if sigma <= 0:
+        return poses
+    mats = np.stack([p.numpy() for p in poses])  # (N,4,4)
+    # 平移平滑
+    trans = mats[:, :3, 3]                        # (N,3)
+    trans_s = gaussian_filter1d(trans, sigma=sigma, axis=0)
+    # 旋转平滑（四元数域）
+    rots = mats[:, :3, :3]                        # (N,3,3)
+    quats = Rotation.from_matrix(rots).as_quat()  # (N,4) xyzw
+    # 翻转相邻四元数符号防止插值穿越球面
+    for i in range(1, len(quats)):
+        if np.dot(quats[i], quats[i-1]) < 0:
+            quats[i] = -quats[i]
+    quats_s = gaussian_filter1d(quats, sigma=sigma, axis=0)
+    quats_s /= np.linalg.norm(quats_s, axis=1, keepdims=True)
+    rots_s = Rotation.from_quat(quats_s).as_matrix()
+    # 重组
+    out = mats.copy()
+    out[:, :3, :3] = rots_s
+    out[:, :3, 3]  = trans_s
+    return [torch.from_numpy(m).float() for m in out]
+
+
 def interpolate_poses(poses, n_frames=300):
     """
     Linear interpolation between poses.
     poses: list of 4x4 matrices
     Returns: list of interpolated 4x4 matrices
     """
-    total_frames = len(poses) * (n_frames // len(poses))
     interpolated = []
 
     for i in range(len(poses)):
@@ -62,7 +91,9 @@ def render_trajectory(dataset: ModelParams, pipeline: PipelineParams, iteration:
         poses = [torch.from_numpy(np.linalg.inv(cam.world_view_transform.cpu().numpy())).float()
                  for cam in train_cameras]
 
-        # Interpolate poses
+        # 平滑相机位姿后插值
+        print(f"Smoothing {len(train_cameras)} poses with sigma={args.smooth_sigma}...")
+        poses = smooth_poses(poses, args.smooth_sigma)
         print(f"Interpolating {len(train_cameras)} training cameras into {n_frames} frames...")
         interp_poses = interpolate_poses(poses, n_frames)
 
@@ -94,6 +125,7 @@ def render_trajectory(dataset: ModelParams, pipeline: PipelineParams, iteration:
                     #   改为每帧用本帧 world_view 重算 full_proj (投影只依赖内参/znear, 用模板的 projection_matrix).
                     # self.full_proj_transform = template.full_proj_transform
                     self.full_proj_transform = (world_view.unsqueeze(0).bmm(template.projection_matrix.unsqueeze(0))).squeeze(0)
+                    self.projection_matrix = template.projection_matrix
                     # [zzx 2026-06-04] 原 -world_view[:3,3] 不符合本仓库 world_view 约定(行向量/转置),
                     #   会让视角相关颜色(SH)算错. 与 Camera 类一致用 inverse()[3,:3].
                     # self.camera_center = -world_view[:3, 3]
@@ -106,10 +138,6 @@ def render_trajectory(dataset: ModelParams, pipeline: PipelineParams, iteration:
             rendering = render(traj_cam, gaussians, pipeline, background,
                               use_trained_exp=False, separate_sh=False)["render"]
 
-            # Handle train_test_exp split
-            if dataset.train_test_exp:
-                rendering = rendering[..., rendering.shape[-1] // 2:]
-
             # Save frame
             frame_path = render_path / f"{idx:05d}.png"
             torchvision.utils.save_image(rendering, frame_path)
@@ -121,7 +149,10 @@ def render_trajectory(dataset: ModelParams, pipeline: PipelineParams, iteration:
         video_path = Path(dataset.model_path) / f"trajectory_{iteration}.mp4"
         print(f"Creating video: {video_path}")
 
-        cmd = f"ffmpeg -framerate 30 -i {render_path}/%05d.png -c:v libx264 -preset fast -pix_fmt yuv420p -y {video_path}"
+        # 用系统ffmpeg避免conda环境ffmpeg缺libx264；pad确保偶数尺寸
+        import shutil as _shutil
+        _ffmpeg = "/usr/bin/ffmpeg" if os.path.exists("/usr/bin/ffmpeg") else (_shutil.which("ffmpeg") or "ffmpeg")
+        cmd = f"{_ffmpeg} -framerate 30 -i {render_path}/%05d.png -vf 'pad=ceil(iw/2)*2:ceil(ih/2)*2' -c:v libx264 -preset fast -pix_fmt yuv420p -y {video_path}"
         os.system(cmd)
 
         print(f"✓ Video saved: {video_path}")
@@ -133,10 +164,11 @@ if __name__ == "__main__":
     pipeline = PipelineParams(parser)
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--n_frames", default=300, type=int, help="Number of frames in trajectory")
+    parser.add_argument("--smooth_sigma", default=3.0, type=float, help="Gaussian smoothing sigma for camera poses (0=off)")
 
     args = get_combined_args(parser)
     print(f"Rendering trajectory for {args.model_path}")
-    print(f"Number of frames: {args.n_frames}")
+    print(f"Number of frames: {args.n_frames}, smooth_sigma: {args.smooth_sigma}")
 
     safe_state(False)
     render_trajectory(model.extract(args), pipeline.extract(args), args.iteration, args.n_frames)
