@@ -106,6 +106,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
+    # [zzx palette 2026-06-07] palette_init_iter<=0: 训练开始即从 SfM 初始颜色提取调色板
+    if opt.use_palette and opt.palette_init_iter <= 0 and not gaussians.use_palette:
+        gaussians.setup_palette(opt.palette_size, opt)
+
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
@@ -172,6 +176,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         gaussians.update_learning_rate(iteration)
 
+        # [zzx palette 2026-06-07] 延迟初始化: 先正常训练若干步, 再从学到的 DC 颜色提取调色板
+        if opt.use_palette and not gaussians.use_palette and opt.palette_init_iter > 0 and iteration == opt.palette_init_iter:
+            gaussians.setup_palette(opt.palette_size, opt)
+
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
@@ -236,6 +244,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss += Lspatial
         else:
             Lspatial = 0
+
+        # [zzx palette 2026-06-07] 可选: 逐点权重熵正则, 鼓励每个高斯偏向单一调色板色 -> 重上色更干净
+        if opt.use_palette and gaussians.use_palette and opt.palette_entropy_weight > 0:
+            w = gaussians.get_palette_weights.clamp_min(1e-8)
+            entropy = -(w * w.log()).sum(dim=1).mean()
+            loss += opt.palette_entropy_weight * entropy
 
         loss.backward()
 
@@ -404,6 +418,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+                if gaussians.use_palette:  # [zzx palette] 步进全局调色板色优化器
+                    gaussians.step_palette()
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -452,9 +468,17 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         pipe, bg = renderArgs[0], renderArgs[1]
                         image = torch.clamp(renderFunc(viewpoint, scene.gaussians, pipe, bg, use_trained_exp=train_test_exp)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    eval_mask = None
+                    if hasattr(viewpoint, 'person_mask') and viewpoint.person_mask is not None:
+                        eval_mask = viewpoint.person_mask.to("cuda")
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
+                        if eval_mask is not None:
+                            eval_mask = eval_mask[..., eval_mask.shape[-1] // 2:]
+                    if eval_mask is not None:
+                        image = image * eval_mask
+                        gt_image = gt_image * eval_mask
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:

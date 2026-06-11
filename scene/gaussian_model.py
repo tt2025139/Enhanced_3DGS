@@ -17,7 +17,7 @@ import os
 import json
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
+from utils.sh_utils import RGB2SH, SH2RGB  # [zzx palette 2026-06-07] SH2RGB 用于调色板初始化
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
@@ -54,6 +54,13 @@ class GaussianModel:
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
+        # [zzx palette 2026-06-07] 调色板编辑: DC 基础色重参数化为 K 个调色板色的凸组合
+        # dc_rgb_i = softmax(W_i) @ sigmoid(Palette);  W: (N,K) 逐点权重, Palette: (K,3) 全局
+        self.use_palette = False
+        self.palette_size = 0
+        self._palette = torch.empty(0)          # (K,3) 原始值, 经 sigmoid 得 RGB
+        self._palette_weights = torch.empty(0)  # (N,K) 逐点权重 logits, 经 softmax 归一
+        self.palette_optimizer = None
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -79,22 +86,35 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            # [zzx palette 2026-06-07] 调色板状态
+            self.use_palette,
+            self.palette_size,
+            self._palette,
+            self._palette_weights,
         )
-    
+
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
+        # [zzx palette 2026-06-07] 兼容新增的调色板字段(放在末尾, 旧 checkpoint 无此字段)
+        (self.active_sh_degree,
+        self._xyz,
+        self._features_dc,
         self._features_rest,
-        self._scaling, 
-        self._rotation, 
+        self._scaling,
+        self._rotation,
         self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
+        self.max_radii2D,
+        xyz_gradient_accum,
         denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        opt_dict,
+        self.spatial_lr_scale,
+        self.use_palette,
+        self.palette_size,
+        self._palette,
+        self._palette_weights) = model_args
         self.training_setup(training_args)
+        if self.use_palette:
+            # 重建调色板优化器并把权重纳入主优化器
+            self._setup_palette_optimizers(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
@@ -111,15 +131,31 @@ class GaussianModel:
     def get_xyz(self):
         return self._xyz
     
+    # [zzx palette 2026-06-07] 调色板色 (K,3) RGB, 经 sigmoid 约束到 (0,1)
+    @property
+    def get_palette(self):
+        return torch.sigmoid(self._palette)
+
+    # [zzx palette] 逐点归一权重 (N,K), softmax 保证非负且和为 1 (凸组合)
+    @property
+    def get_palette_weights(self):
+        return torch.softmax(self._palette_weights, dim=1)
+
+    # [zzx palette] 由调色板+权重算出 DC 项的 SH 系数 (N,1,3)
+    def _palette_features_dc(self):
+        rgb = self.get_palette_weights @ self.get_palette   # (N,3) 凸组合的 RGB
+        return RGB2SH(rgb).unsqueeze(1)                      # (N,1,3)
+
     @property
     def get_features(self):
-        features_dc = self._features_dc
+        # [zzx palette] 启用调色板时 DC 由调色板导出, 其余视角相关 SH 不变
+        features_dc = self._palette_features_dc() if self.use_palette else self._features_dc
         features_rest = self._features_rest
         return torch.cat((features_dc, features_rest), dim=1)
-    
+
     @property
     def get_features_dc(self):
-        return self._features_dc
+        return self._palette_features_dc() if self.use_palette else self._features_dc
     
     @property
     def get_features_rest(self):
@@ -209,6 +245,71 @@ class GaussianModel:
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
 
+    # ====================== [zzx palette 2026-06-07] 调色板编辑相关 ======================
+    @staticmethod
+    def _kmeans(x, K, n_iter=30, seed=0):
+        """简易 torch k-means (Lloyd). x:(N,3) -> centers:(K,3). 不依赖 sklearn。"""
+        N = x.shape[0]
+        g = torch.Generator(device=x.device).manual_seed(seed)
+        # k-means++ 风格的简化初始化: 首点随机, 其余按距离平方概率采样
+        centers = x[torch.randint(0, N, (1,), generator=g, device=x.device)]
+        for _ in range(K - 1):
+            d2 = torch.cdist(x, centers).min(dim=1).values ** 2
+            probs = d2 / d2.sum().clamp_min(1e-12)
+            idx = torch.multinomial(probs, 1, generator=g)
+            centers = torch.cat([centers, x[idx]], dim=0)
+        for _ in range(n_iter):
+            assign = torch.cdist(x, centers).argmin(dim=1)   # (N,)
+            new_centers = centers.clone()
+            for k in range(K):
+                m = assign == k
+                if m.any():
+                    new_centers[k] = x[m].mean(dim=0)
+            if torch.allclose(new_centers, centers, atol=1e-5):
+                centers = new_centers
+                break
+            centers = new_centers
+        return centers
+
+    def setup_palette(self, K, training_args, init_temp=0.05):
+        """从当前 DC 颜色用 k-means 提取 K 个调色板色, 并初始化逐点凸组合权重。
+        之后切换为调色板参数化 (use_palette=True), 渲染/densify 自动改用调色板。"""
+        with torch.no_grad():
+            rgb = SH2RGB(self._features_dc.squeeze(1)).clamp(0.0, 1.0)   # (N,3)
+            centers = self._kmeans(rgb, K).clamp(1e-4, 1 - 1e-4)         # (K,3)
+            # 权重 logits = -dist / temp, softmax 后近似 one-hot 到最近调色板色
+            dist = torch.cdist(rgb, centers)                            # (N,K)
+            logits = -dist / max(init_temp, 1e-6)
+        self._palette = nn.Parameter(inverse_sigmoid(centers).contiguous().requires_grad_(True))
+        self._palette_weights = nn.Parameter(logits.contiguous().requires_grad_(True))
+        self.palette_size = K
+        self.use_palette = True
+        self._setup_palette_optimizers(training_args)
+        print(f"[zzx palette] 调色板已初始化: K={K}, 点数={rgb.shape[0]}")
+
+    def _setup_palette_optimizers(self, training_args):
+        """把逐点权重加入主优化器(随 densify/prune 一起增删), 全局调色板色单独优化器。
+        同时冻结原 f_dc (不再使用)。"""
+        palette_lr = getattr(training_args, "palette_lr", 0.005)
+        palette_weight_lr = getattr(training_args, "palette_weight_lr", 0.01)
+        # 冻结 f_dc 学习率 (DC 改由调色板导出, _features_dc 不再训练)
+        existing = {g["name"] for g in self.optimizer.param_groups}
+        for g in self.optimizer.param_groups:
+            if g["name"] == "f_dc":
+                g["lr"] = 0.0
+        # 逐点权重作为新参数组加入主优化器 (名字 palette_weights, 参与 densify/prune)
+        if "palette_weights" not in existing:
+            self.optimizer.add_param_group(
+                {"params": [self._palette_weights], "lr": palette_weight_lr, "name": "palette_weights"})
+        # 全局调色板色单独优化 (与 exposure 类似, 不参与逐点增删)
+        self.palette_optimizer = torch.optim.Adam([self._palette], lr=palette_lr, eps=1e-15)
+
+    def step_palette(self):
+        if self.palette_optimizer is not None:
+            self.palette_optimizer.step()
+            self.palette_optimizer.zero_grad(set_to_none=True)
+    # ==================================================================================
+
     def update_learning_rate(self, iteration):
         if self.pretrained_exposures is None:
             for param_group in self.exposure_optimizer.param_groups:
@@ -231,6 +332,9 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        if self.use_palette:  # [zzx palette] 逐点调色板权重 logits, 供编辑时重建
+            for k in range(self.palette_size):
+                l.append('palette_w_{}'.format(k))
         return l
 
     def save_ply(self, path):
@@ -238,7 +342,11 @@ class GaussianModel:
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        # [zzx palette] 启用调色板时, 把调色板导出的 DC 烘焙进 f_dc, 使 ply 仍可被标准 render.py 渲染
+        if self.use_palette:
+            f_dc = self._palette_features_dc().detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        else:
+            f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
@@ -247,7 +355,14 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        arrays = [xyz, normals, f_dc, f_rest, opacities, scale, rotation]
+        if self.use_palette:  # [zzx palette] 追加逐点权重列 + 旁路写调色板 json
+            arrays.append(self._palette_weights.detach().cpu().numpy())
+            palette_rgb = self.get_palette.detach().cpu().numpy()
+            with open(os.path.join(os.path.dirname(path), "palette.json"), "w") as f:
+                json.dump({"palette_size": int(self.palette_size),
+                           "palette_rgb": palette_rgb.tolist()}, f, indent=2)
+        attributes = np.concatenate(arrays, axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -309,6 +424,26 @@ class GaussianModel:
 
         self.active_sh_degree = self.max_sh_degree
 
+        # [zzx palette 2026-06-07] 若存在调色板旁路文件与逐点权重列, 重建调色板参数(供编辑)
+        palette_json = os.path.join(os.path.dirname(path), "palette.json")
+        pw_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("palette_w_")]
+        if os.path.exists(palette_json) and len(pw_names) > 0:
+            with open(palette_json, "r") as f:
+                pinfo = json.load(f)
+            K = int(pinfo["palette_size"])
+            palette_rgb = np.asarray(pinfo["palette_rgb"], dtype=np.float32)          # (K,3) RGB
+            pw_names = sorted(pw_names, key=lambda x: int(x.split('_')[-1]))
+            weights = np.zeros((xyz.shape[0], len(pw_names)), dtype=np.float32)
+            for idx, attr_name in enumerate(pw_names):
+                weights[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            # palette_rgb 是 sigmoid 后的 RGB, 反 sigmoid 还原为原始可优化值
+            palette_rgb_t = torch.tensor(palette_rgb, dtype=torch.float, device="cuda").clamp(1e-4, 1 - 1e-4)
+            self._palette = nn.Parameter(inverse_sigmoid(palette_rgb_t).requires_grad_(True))
+            self._palette_weights = nn.Parameter(torch.tensor(weights, dtype=torch.float, device="cuda").requires_grad_(True))
+            self.palette_size = K
+            self.use_palette = True
+            print(f"[zzx palette] 已从 ply 重建调色板: K={K}")
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -352,6 +487,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        if self.use_palette:  # [zzx palette] 逐点权重随剪枝同步
+            self._palette_weights = optimizable_tensors["palette_weights"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -381,13 +518,15 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_palette_weights=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
         "rotation" : new_rotation}
+        if self.use_palette:  # [zzx palette] 新增点的逐点权重一并拼接
+            d["palette_weights"] = new_palette_weights
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -396,6 +535,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        if self.use_palette:
+            self._palette_weights = optimizable_tensors["palette_weights"]
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -421,8 +562,10 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        # [zzx palette] split 出的新点继承父点权重
+        new_palette_weights = self._palette_weights[selected_pts_mask].repeat(N, 1) if self.use_palette else None
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, new_palette_weights)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -441,8 +584,10 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        # [zzx palette] clone 出的新点继承父点权重
+        new_palette_weights = self._palette_weights[selected_pts_mask] if self.use_palette else None
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_palette_weights)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, cameras=None, depth_prune_threshold=0.3, depth_prune_min_views=2):
         grads = self.xyz_gradient_accum / self.denom
