@@ -1,3 +1,4 @@
 [submodule "3dgs_indoor"]
 	path = 3dgs_indoor
 	url = git@github.com:le-chatty/3dgs_indoor.git
+	
