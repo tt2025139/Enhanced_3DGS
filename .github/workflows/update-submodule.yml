@@ -1,0 +1,22 @@
+name: Update Submodule
+
+on:
+  workflow_dispatch: # 允许你在网页上手动点击运行
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout parent repo
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Submodule
+        run: |
+          git submodule update --remote --merge
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: update submodule to latest" || echo "No changes to commit"
+          git push
